@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# pkg-config for a PS5 build that uses PacBrew packages.
+#
+# The SDK's own prospero-pkg-config overwrites PKG_CONFIG_LIBDIR with the SDK
+# sysroot, so packages installed by PacBrew are never found. This looks in both,
+# PacBrew first. Its .pc files give paths like /user/homebrew/include, which
+# only resolve once the sysroot is prefixed, so that is set here rather than
+# left empty.
+export PKG_CONFIG_DIR=
+export PKG_CONFIG_SYSROOT_DIR="${PACBREW:?set PACBREW}/../.."
+export PKG_CONFIG_LIBDIR="${PACBREW:?set PACBREW}/lib/pkgconfig:${PS5_PAYLOAD_SDK:-/opt/ps5-payload-sdk}/target/user/homebrew/lib/pkgconfig"
+export PKG_CONFIG_PATH="${PACBREW:?set PACBREW}/libdata/pkgconfig"
+exec pkg-config --static "$@"

@@ -1,0 +1,9 @@
+# Built by build.sh, and the upstream checkout has its own history.
+/build-ps5/
+/stk-code/
+# The packaged title: 33 MB binary and 776 MB of assets from the 1.5 release.
+/pkg/
+/sdk-new/
+/dist/
+# Kept locally, not published.
+/docs/decision-log.md

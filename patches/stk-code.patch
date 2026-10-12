@@ -1,0 +1,1897 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4e5618d..a913c28 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,6 +4,22 @@ cmake_minimum_required(VERSION 3.12...4.0)
+ project(SuperTuxKart)
+ set(PROJECT_VERSION "git")
+ 
++# The game recognises its data directory by a file called
++# supertuxkart.<version>, so a build calling itself "git" cannot see assets
++# from a numbered release. Taking the version from whatever is in the asset
++# tree keeps the two in step; STK_ASSET_DIR is set by the PS5 build.
++if(STK_ASSET_DIR)
++    file(GLOB stk_version_files "${STK_ASSET_DIR}/supertuxkart.*")
++    foreach(candidate IN LISTS stk_version_files)
++        get_filename_component(stk_version_name "${candidate}" NAME)
++        string(REGEX REPLACE "^supertuxkart\\." "" stk_version "${stk_version_name}")
++        if(stk_version MATCHES "^[0-9]+\\.[0-9]+$")
++            set(PROJECT_VERSION "${stk_version}")
++            message(STATUS "Version ${stk_version} taken from the asset tree")
++        endif()
++    endforeach()
++endif()
++
+ add_definitions( -DSUPERTUXKART_VERSION="${PROJECT_VERSION}" )
+ 
+ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake")
+@@ -547,6 +563,13 @@ endif()
+ # Provides list of source and header files (STK_SOURCES and STK_HEADERS)
+ include(sources.cmake)
+ 
++if (PROSPERO_SUPPORT_SOURCES)
++    # PS5: a log that survives having nowhere to print, and the allocator that
++    # gives the game more than the sandbox libc heap holds. Set by the
++    # out-of-tree ps5-gl.cmake, so an ordinary build never sees this.
++    set(STK_SOURCES ${STK_SOURCES} ${PROSPERO_SUPPORT_SOURCES})
++endif()
++
+ if (USE_APPLE_NETWORK_LIBRARIES)
+     add_definitions(-DAPPLE_NETWORK_LIBRARIES)
+     set(STK_SOURCES
+@@ -640,6 +663,14 @@ else()
+         endif()
+     else()
+         add_executable(supertuxkart ${STK_SOURCES} ${STK_RESOURCES} ${STK_HEADERS})
++
++if (PS5_FINAL_LINK_FLAGS)
++    # Only the game executable gets the custom entry point and linker layout;
++    # CMake's feature tests must keep building with the ordinary ones.
++    set_property(TARGET supertuxkart APPEND_STRING
++                 PROPERTY LINK_FLAGS " ${PS5_FINAL_LINK_FLAGS}")
++endif()
++
+     endif()
+     if (NOT WIN32)
+         target_link_libraries(supertuxkart ${PTHREAD_LIBRARY})
+diff --git a/lib/enet/unix.c b/lib/enet/unix.c
+index c10a3d9..b8ec308 100644
+--- a/lib/enet/unix.c
++++ b/lib/enet/unix.c
+@@ -11,6 +11,7 @@
+ #include <netinet/tcp.h>
+ #include <netdb.h>
+ #include <unistd.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <errno.h>
+ #include <time.h>
+@@ -250,6 +251,9 @@ enet_address_get_host (const ENetAddress * address, char * name, size_t nameLeng
+ int
+ enet_socket_bind (ENetSocket socket, const ENetAddress * address)
+ {
++#ifdef __PROSPERO__
++    fprintf (stderr, "stk:     enet: bind\n");
++#endif
+     if (isIPv6Socket() == 1)
+     {
+         struct sockaddr_in6 sin;
+@@ -264,7 +268,13 @@ enet_socket_bind (ENetSocket socket, const ENetAddress * address)
+         else
+         {
+             sin.sin6_port = 0;
++#ifdef __PROSPERO__
++            /* in6addr_any is a data object, and the console's libSceNet stub
++               only offers it as a function import. The value is all zeroes. */
++            memset (& sin.sin6_addr, 0, sizeof (sin.sin6_addr));
++#else
+             sin.sin6_addr = in6addr_any;
++#endif
+         }
+ 
+         return bind (socket,
+@@ -299,6 +309,9 @@ enet_socket_bind (ENetSocket socket, const ENetAddress * address)
+ int
+ enet_socket_get_address (ENetSocket socket, ENetAddress * address)
+ {
++#ifdef __PROSPERO__
++    fprintf (stderr, "stk:     enet: getsockname\n");
++#endif
+     if (isIPv6Socket() == 1)
+     {
+         struct sockaddr_in6 sin;
+@@ -339,7 +352,15 @@ ENetSocket
+ enet_socket_create (ENetSocketType type)
+ {
+     int pf_family = isIPv6Socket() == 1 ? PF_INET6 : PF_INET;
++#ifdef __PROSPERO__
++    /* Start-up markers: a title ends without a word when a call is refused,
++       so each step says so before it runs. */
++    fprintf (stderr, "stk:     enet: socket(family %d)\n", pf_family);
++#endif
+     int socket_fd = socket (pf_family, type == ENET_SOCKET_TYPE_DATAGRAM ? SOCK_DGRAM : SOCK_STREAM, 0);
++#ifdef __PROSPERO__
++    fprintf (stderr, "stk:     enet: socket -> %d\n", socket_fd);
++#endif
+     if (isIPv6Socket() == 1 && socket_fd != -1)
+     {
+         int no = 0;
+diff --git a/lib/graphics_engine/src/ge_gl_texture.cpp b/lib/graphics_engine/src/ge_gl_texture.cpp
+index 1774f28..e6803f5 100644
+--- a/lib/graphics_engine/src/ge_gl_texture.cpp
++++ b/lib/graphics_engine/src/ge_gl_texture.cpp
+@@ -232,8 +232,15 @@ void GEGLTexture::updateTexture(void* data, video::ECOLOR_FORMAT format, u32 w,
+                 GL_UNSIGNED_BYTE, u8_data);
+         }
+     }
++#ifndef __PROSPERO__
++    // On the PS5 driver glGenerateMipmap waits for the GPU to finish with the
++    // texture and then rebuilds every level on the CPU. Fonts add glyphs to
++    // their page this way, many per new message, and the game stalled for
++    // seconds each time. Text is drawn at its own size, from level 0, which
++    // is always current; only heavily scaled-down text could miss new glyphs.
+     if (hasMipMaps())
+         glGenerateMipmap(GL_TEXTURE_2D);
++#endif
+     glBindTexture(GL_TEXTURE_2D, 0);
+ }   // updateTexture
+ 
+diff --git a/lib/irrlicht/source/Irrlicht/CFileSystem.cpp b/lib/irrlicht/source/Irrlicht/CFileSystem.cpp
+index 26abd42..083b678 100644
+--- a/lib/irrlicht/source/Irrlicht/CFileSystem.cpp
++++ b/lib/irrlicht/source/Irrlicht/CFileSystem.cpp
+@@ -54,9 +54,18 @@ CFileSystem::CFileSystem()
+ 	setDebugName("CFileSystem");
+ 	#endif
+ 
++#ifdef __PROSPERO__
++	fprintf(stderr, "stk:       CFileSystem: entered\n");
++#endif
+ 	setFileListSystem(FILESYSTEM_NATIVE);
++#ifdef __PROSPERO__
++	fprintf(stderr, "stk:       CFileSystem: list system set\n");
++#endif
+ 	//! reset current working directory
+ 	getWorkingDirectory();
++#ifdef __PROSPERO__
++	fprintf(stderr, "stk:       CFileSystem: cwd done\n");
++#endif
+ 
+ #ifdef __IRR_COMPILE_WITH_TAR_ARCHIVE_LOADER_
+ 	ArchiveLoader.push_back(new CArchiveLoaderTAR(this));
+@@ -512,6 +521,7 @@ IFileArchive* CFileSystem::getFileArchive(u32 index)
+ //! Returns the string of the current working directory
+ const io::path& CFileSystem::getWorkingDirectory()
+ {
++
+ 	EFileSystemType type = FileSystemType;
+ 
+ 	if (type != FILESYSTEM_NATIVE)
+diff --git a/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.cpp b/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.cpp
+index 9bbeb96..0e109df 100644
+--- a/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.cpp
++++ b/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.cpp
+@@ -31,6 +31,14 @@
+ 
+ extern bool GLContextDebugBit;
+ 
++#ifdef __PROSPERO__
++#include <EGL/egl.h>
++#include <time.h>
++#include <string.h>
++#include <EGL/eglext.h>
++extern "C" int sceSystemServiceHideSplashScreen(void);
++#endif
++
+ namespace irr
+ {
+ 	namespace video
+@@ -106,14 +114,20 @@ CIrrDeviceSDL::CIrrDeviceSDL(const SIrrlichtCreationParameters& param)
+ 	}
+ #endif
+ 
++#ifdef __PROSPERO__
++	// No SDL video in a title: the screen comes from EGL in createWindow.
++	// Events are still needed for the controller.
++	u32 init_flags = SDL_INIT_TIMER | SDL_INIT_EVENTS;
++#else
+ 	u32 init_flags = SDL_INIT_TIMER | SDL_INIT_VIDEO;
++#endif
+ 	if (SDL_InitSubSystem(init_flags) < 0)
+ 	{
+ 		os::Printer::log("Unable to initialize SDL!", SDL_GetError());
+ 		Close = true;
+ 	}
+ 
+-#if SDL_VERSION_ATLEAST(2, 0, 9)
++#if SDL_VERSION_ATLEAST(2, 0, 9) && !defined(__PROSPERO__)
+ 	// Don't exit if failed to init sensor (doesn't work in wine)
+ 	if (SDL_InitSubSystem(SDL_INIT_SENSOR) < 0)
+ 	{
+@@ -238,7 +252,11 @@ CIrrDeviceSDL::~CIrrDeviceSDL()
+ 	if (Window)
+ 		SDL_DestroyWindow(Window);
+ 		
++#ifdef __PROSPERO__
++	u32 flags = SDL_INIT_TIMER | SDL_INIT_EVENTS;
++#else
+ 	u32 flags = SDL_INIT_TIMER | SDL_INIT_VIDEO;
++#endif
+ 	SDL_QuitSubSystem(flags);
+ }
+ 
+@@ -342,6 +360,128 @@ bool versionCorrect(int major, int minor)
+ }
+ 
+ 
++#ifdef __PROSPERO__
++// ----------------------------------------------------------------------------
++// The PS5 OpenGL SDK hands out one full-screen surface through EGL; there is
++// no window to create, and SDL's video driver does not run inside a title.
++// OliSe Player draws the same way.
++static EGLDisplay g_ps5_display = EGL_NO_DISPLAY;
++static EGLSurface g_ps5_surface = EGL_NO_SURFACE;
++static EGLContext g_ps5_context = EGL_NO_CONTEXT;
++
++void* ps5GLGetProcAddress(const char* name)
++{
++	return (void*)eglGetProcAddress(name);
++}
++
++void ps5GLSwapBuffers()
++{
++	if (g_ps5_surface != EGL_NO_SURFACE)
++		eglSwapBuffers(g_ps5_display, g_ps5_surface);
++}
++
++void ps5GLSetSwapInterval(int interval)
++{
++	if (g_ps5_display != EGL_NO_DISPLAY)
++		eglSwapInterval(g_ps5_display, interval);
++}
++
++static void* ps5GLLoad(const char* name)
++{
++	return ps5GLGetProcAddress(name);
++}
++
++// Creates the display, surface and an OpenGL 4.3 core context, and reports
++// the size of the screen. False when any step fails; each says which.
++static bool ps5CreateGLContext(u32* width, u32* height)
++{
++	fprintf(stderr, "stk:     egl: creating the display\n");
++	(void)sceSystemServiceHideSplashScreen();
++
++	g_ps5_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++	EGLint major = 0, minor = 0;
++	if (g_ps5_display == EGL_NO_DISPLAY || !eglInitialize(g_ps5_display, &major, &minor))
++	{
++		fprintf(stderr, "stk:     egl: no display (0x%x)\n", eglGetError());
++		return false;
++	}
++	fprintf(stderr, "stk:     egl: EGL %d.%d\n", major, minor);
++	if (!eglBindAPI(EGL_OPENGL_API))
++	{
++		fprintf(stderr, "stk:     egl: eglBindAPI failed (0x%x)\n", eglGetError());
++		return false;
++	}
++
++	// The game draws into its own framebuffers, but the menus and the
++	// fallback renderer use the default one and need depth and stencil.
++	// A config without them is still better than none.
++	const EGLint with_depth[] = {
++		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++		EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++		EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
++		EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
++		EGL_NONE,
++	};
++	const EGLint without_depth[] = {
++		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++		EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++		EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
++		EGL_NONE,
++	};
++	EGLConfig config = NULL;
++	EGLint count = 0;
++	if (!eglChooseConfig(g_ps5_display, with_depth, &config, 1, &count) || count < 1)
++	{
++		fprintf(stderr, "stk:     egl: no config with depth and stencil, trying without\n");
++		if (!eglChooseConfig(g_ps5_display, without_depth, &config, 1, &count) || count < 1)
++		{
++			fprintf(stderr, "stk:     egl: no config (0x%x)\n", eglGetError());
++			return false;
++		}
++	}
++
++	g_ps5_surface = eglCreateWindowSurface(g_ps5_display, config, 0, NULL);
++	if (g_ps5_surface == EGL_NO_SURFACE)
++	{
++		fprintf(stderr, "stk:     egl: no surface (0x%x)\n", eglGetError());
++		return false;
++	}
++
++	const EGLint context_attributes[] = {
++		EGL_CONTEXT_MAJOR_VERSION_KHR, 4,
++		EGL_CONTEXT_MINOR_VERSION_KHR, 3,
++		EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
++		EGL_NONE,
++	};
++	g_ps5_context = eglCreateContext(g_ps5_display, config, EGL_NO_CONTEXT, context_attributes);
++	if (g_ps5_context == EGL_NO_CONTEXT)
++	{
++		fprintf(stderr, "stk:     egl: no context (0x%x)\n", eglGetError());
++		return false;
++	}
++	if (!eglMakeCurrent(g_ps5_display, g_ps5_surface, g_ps5_surface, g_ps5_context))
++	{
++		fprintf(stderr, "stk:     egl: eglMakeCurrent failed (0x%x)\n", eglGetError());
++		return false;
++	}
++
++	EGLint w = 0, h = 0;
++	eglQuerySurface(g_ps5_display, g_ps5_surface, EGL_WIDTH, &w);
++	eglQuerySurface(g_ps5_display, g_ps5_surface, EGL_HEIGHT, &h);
++	*width = (u32)w;
++	*height = (u32)h;
++	fprintf(stderr, "stk:     egl: surface %dx%d, loading OpenGL\n", w, h);
++
++	if (gladLoadGL((GLADloadfunc)ps5GLLoad) == 0)
++	{
++		fprintf(stderr, "stk:     egl: gladLoadGL failed\n");
++		return false;
++	}
++	fprintf(stderr, "stk:     egl: %s\n", (const char*)glGetString(GL_VERSION));
++	return true;
++}
++#endif
++
+ // Used in OptionsScreenVideo for live fullscreen toggle for vulkan driver
+ extern "C" void update_fullscreen_desktop(int val)
+ {
+@@ -380,6 +520,10 @@ extern "C" void update_swap_interval(int swap_interval)
+ 		return;
+ 	}
+ 
++#ifdef __PROSPERO__
++	irr::ps5GLSetSwapInterval(swap_interval);
++	return;
++#endif
+ 	// Try adaptive vsync first if support
+ 	if (swap_interval > 0)
+ 	{
+@@ -395,6 +539,27 @@ extern "C" void update_swap_interval(int swap_interval)
+ bool CIrrDeviceSDL::createWindow()
+ {
+ 	CreationParams.m_sdl_window = NULL;
++#ifdef __PROSPERO__
++	if (CreationParams.DriverType != video::EDT_OPENGL)
++	{
++		os::Printer::log("Only OpenGL is available on the PS5.", ELL_ERROR);
++		return false;
++	}
++	irr::video::useCoreContext = true;
++	u32 width = 0, height = 0;
++	if (!ps5CreateGLContext(&width, &height))
++	{
++		os::Printer::log("Could not initialize display!");
++		return false;
++	}
++	// The surface is the whole screen whatever size was asked for.
++	Width = width;
++	Height = height;
++	CreationParams.WindowSize = core::dimension2d<u32>(width, height);
++	Context = (SDL_GLContext)g_ps5_context;
++	update_swap_interval(CreationParams.SwapInterval);
++	return true;
++#endif
+ 	// Ignore alpha size here, this follow irr_driver.cpp:450
+ 	// Try 32 and, upon failure, 24 then 16 bit per pixels
+ 	if (CreationParams.DriverType == video::EDT_OPENGL ||
+diff --git a/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.h b/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.h
+index c773561..048f045 100644
+--- a/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.h
++++ b/lib/irrlicht/source/Irrlicht/CIrrDeviceSDL.h
+@@ -333,6 +333,14 @@ class MoltenVK;
+ 		const core::dimension2du& getRealScreenSize() const;
+ 	};
+ 
++#ifdef __PROSPERO__
++	// A PS5 title cannot use SDL's video driver, so the OpenGL context comes
++	// from the console's EGL instead. The drivers reach it through these.
++	void* ps5GLGetProcAddress(const char* name);
++	void ps5GLSwapBuffers();
++	void ps5GLSetSwapInterval(int interval);
++#endif
++
+ } // end namespace irr
+ 
+ #endif // _IRR_COMPILE_WITH_SDL_DEVICE_
+diff --git a/lib/irrlicht/source/Irrlicht/COpenGLDriver.cpp b/lib/irrlicht/source/Irrlicht/COpenGLDriver.cpp
+index d6b40ab..0ca1dc9 100644
+--- a/lib/irrlicht/source/Irrlicht/COpenGLDriver.cpp
++++ b/lib/irrlicht/source/Irrlicht/COpenGLDriver.cpp
+@@ -1014,7 +1014,11 @@ bool COpenGLDriver::endScene()
+ #ifdef _IRR_COMPILE_WITH_SDL_DEVICE_
+ 	if (DeviceType == EIDT_SDL)
+ 	{
++#ifdef __PROSPERO__
++		ps5GLSwapBuffers();
++#else
+ 		SDL_GL_SwapWindow(SDLDevice->getWindow());
++#endif
+ 		return true;
+ 	}
+ #endif
+diff --git a/lib/irrlicht/source/Irrlicht/COpenGLExtensionHandler.cpp b/lib/irrlicht/source/Irrlicht/COpenGLExtensionHandler.cpp
+index d8e86c7..f70067c 100644
+--- a/lib/irrlicht/source/Irrlicht/COpenGLExtensionHandler.cpp
++++ b/lib/irrlicht/source/Irrlicht/COpenGLExtensionHandler.cpp
+@@ -11,6 +11,14 @@
+ #include "SMaterial.h" // for MATERIAL_MAX_TEXTURES
+ #include "fast_atof.h"
+ 
++#ifdef __PROSPERO__
++namespace irr
++{
++	// CIrrDeviceSDL.cpp: OpenGL entry points come from EGL on the PS5.
++	void* ps5GLGetProcAddress(const char* name);
++}
++#endif
++
+ namespace irr
+ {
+ namespace video
+@@ -390,7 +398,9 @@ void COpenGLExtensionHandler::initExtensions(bool stencilBuffer, bool useCoreCon
+ 	StencilBuffer=stencilBuffer;
+ 
+ #ifdef _IRR_OPENGL_USE_EXTPOINTER_
+-#if defined(_IRR_COMPILE_WITH_SDL_DEVICE_) && !defined(_IRR_COMPILE_WITH_X11_DEVICE_)
++#if defined(__PROSPERO__)
++	#define IRR_OGL_LOAD_EXTENSION(x) irr::ps5GLGetProcAddress(reinterpret_cast<const char*>(x))
++#elif defined(_IRR_COMPILE_WITH_SDL_DEVICE_) && !defined(_IRR_COMPILE_WITH_X11_DEVICE_)
+ 	#define IRR_OGL_LOAD_EXTENSION(x) SDL_GL_GetProcAddress(reinterpret_cast<const char*>(x))
+ #elif defined (_IRR_WINDOWS_API_)
+ 	#define IRR_OGL_LOAD_EXTENSION(x) wglGetProcAddress(reinterpret_cast<const char*>(x))
+diff --git a/src/graphics/central_settings.cpp b/src/graphics/central_settings.cpp
+index 086ae60..6d115f6 100644
+--- a/src/graphics/central_settings.cpp
++++ b/src/graphics/central_settings.cpp
+@@ -379,7 +379,18 @@ bool CentralVideoSettings::isEXTTextureCompressionS3TCSRGBUsable() const
+ 
+ bool CentralVideoSettings::isARBBufferStorageUsable() const
+ {
++#ifdef __PROSPERO__
++    // The PS5 driver keeps GPU data in CPU memory and writes the CPU caches
++    // back before the GPU reads. It remembers what it already published, but
++    // not for persistently mapped buffers: those are written back in full on
++    // every draw that uses them ("persistent mappings keep their per-use
++    // publication", ps5_screen.c). STK maps its instance and skinning data
++    // that way when buffer storage is available, so without it STK uses
++    // glBufferSubData, and only the bytes written are published.
++    return false;
++#else
+     return hasBufferStorage;
++#endif
+ }
+ 
+ bool CentralVideoSettings::isARBComputeShaderUsable() const
+diff --git a/src/graphics/draw_calls.cpp b/src/graphics/draw_calls.cpp
+index 7a6775c..37093b5 100644
+--- a/src/graphics/draw_calls.cpp
++++ b/src/graphics/draw_calls.cpp
+@@ -18,6 +18,9 @@
+ #ifndef SERVER_ONLY
+ #include "graphics/draw_calls.hpp"
+ 
++#include <chrono>
++#include <cstdio>
++
+ #include "config/stk_config.hpp"
+ #include "config/user_config.hpp"
+ #include "graphics/cpu_particle_manager.hpp"
+diff --git a/src/graphics/lighting_passes.cpp b/src/graphics/lighting_passes.cpp
+index 9b8d033..bea4bec 100644
+--- a/src/graphics/lighting_passes.cpp
++++ b/src/graphics/lighting_passes.cpp
+@@ -17,6 +17,7 @@
+ 
+ #ifndef SERVER_ONLY
+ 
++#include <cstdio>
+ #include "graphics/lighting_passes.hpp"
+ #include "config/user_config.hpp"
+ #include "graphics/central_settings.hpp"
+@@ -65,6 +66,27 @@ const unsigned int LightBaseClass::MAXLIGHT;
+ // ============================================================================
+ LightBaseClass::PointLightInfo m_point_lights_info[LightBaseClass::MAXLIGHT];
+ 
++// ============================================================================
++/** pointlight.vert has no layout qualifiers, and the PS5 driver cannot be
++ *  asked where it put the inputs (glGetAttribLocation ends the process), so
++ *  their locations are fixed before linking. Doing that everywhere is valid
++ *  OpenGL and keeps one code path. */
++enum LightAttribute
++{
++    LIGHT_POSITION = 0,
++    LIGHT_ENERGY = 1,
++    LIGHT_COLOR = 2,
++    LIGHT_RADIUS = 3,
++    LIGHT_DIRECTION_SCALE_OFFSET = 4
++};
++
++static const std::vector<std::pair<GLuint, const char*> > LIGHT_ATTRIBUTES =
++{
++    { LIGHT_POSITION, "Position" }, { LIGHT_ENERGY, "Energy" },
++    { LIGHT_COLOR, "Color" }, { LIGHT_RADIUS, "Radius" },
++    { LIGHT_DIRECTION_SCALE_OFFSET, "Direction_scale_offset" }
++};
++
+ // ============================================================================
+ class PointLightShader : public TextureShader < PointLightShader, 2 >
+ {
+@@ -73,6 +95,7 @@ public:
+     GLuint vao;
+     PointLightShader()
+     {
++        m_attribute_bindings = LIGHT_ATTRIBUTES;
+         loadProgram(OBJECT, GL_VERTEX_SHADER, "pointlight.vert",
+                             GL_FRAGMENT_SHADER, "pointlight.frag");
+ 
+@@ -88,11 +111,11 @@ public:
+                      LightBaseClass::MAXLIGHT * sizeof(LightBaseClass::PointLightInfo),
+                      0, GL_DYNAMIC_DRAW);
+ 
+-        GLuint attrib_Position = glGetAttribLocation(m_program, "Position");
+-        GLuint attrib_Color = glGetAttribLocation(m_program, "Color");
+-        GLuint attrib_Energy = glGetAttribLocation(m_program, "Energy");
+-        GLuint attrib_Radius = glGetAttribLocation(m_program, "Radius");
+-        GLuint attrib_DSO = glGetAttribLocation(m_program, "Direction_scale_offset");
++        GLuint attrib_Position = LIGHT_POSITION;
++        GLuint attrib_Color = LIGHT_COLOR;
++        GLuint attrib_Energy = LIGHT_ENERGY;
++        GLuint attrib_Radius = LIGHT_RADIUS;
++        GLuint attrib_DSO = LIGHT_DIRECTION_SCALE_OFFSET;
+ 
+         glEnableVertexAttribArray(attrib_Position);
+         glVertexAttribPointer(attrib_Position, 3, GL_FLOAT, GL_FALSE,
+@@ -138,6 +161,7 @@ public:
+     GLuint vao;
+     PointLightScatterShader()
+     {
++        m_attribute_bindings = LIGHT_ATTRIBUTES;
+         loadProgram(OBJECT, GL_VERTEX_SHADER, "pointlight.vert",
+                             GL_FRAGMENT_SHADER, "pointlightscatter.frag");
+ 
+@@ -149,11 +173,11 @@ public:
+ 
+         glBindBuffer(GL_ARRAY_BUFFER, PointLightShader::getInstance()->vbo);
+ 
+-        GLuint attrib_Position = glGetAttribLocation(m_program, "Position");
+-        GLuint attrib_Color = glGetAttribLocation(m_program, "Color");
+-        GLuint attrib_Energy = glGetAttribLocation(m_program, "Energy");
+-        GLuint attrib_Radius = glGetAttribLocation(m_program, "Radius");
+-        GLuint attrib_DSO = glGetAttribLocation(m_program, "Direction_scale_offset");
++        GLuint attrib_Position = LIGHT_POSITION;
++        GLuint attrib_Color = LIGHT_COLOR;
++        GLuint attrib_Energy = LIGHT_ENERGY;
++        GLuint attrib_Radius = LIGHT_RADIUS;
++        GLuint attrib_DSO = LIGHT_DIRECTION_SCALE_OFFSET;
+ 
+         glEnableVertexAttribArray(attrib_Position);
+         glVertexAttribPointer(attrib_Position, 3, GL_FLOAT, GL_FALSE,
+diff --git a/src/graphics/shader.cpp b/src/graphics/shader.cpp
+index 1a11f64..49912d6 100644
+--- a/src/graphics/shader.cpp
++++ b/src/graphics/shader.cpp
+@@ -89,8 +89,15 @@ GLuint ShaderBase::createVAO()
+     GLuint vao;
+     glGenVertexArrays(1, &vao);
+     glBindVertexArray(vao);
++#ifdef __PROSPERO__
++    // screenquad.vert fixes these with layout qualifiers, which the PS5
++    // build always has; the driver cannot be asked (see shader.hpp).
++    GLuint attrib_position = 0;
++    GLuint attrib_texcoord = 3;
++#else
+     GLuint attrib_position = glGetAttribLocation(m_program, "Position");
+     GLuint attrib_texcoord = glGetAttribLocation(m_program, "Texcoord");
++#endif
+     glBindBuffer(GL_ARRAY_BUFFER, SharedGPUObjects::getQuadVBO());
+     glEnableVertexAttribArray(attrib_position);
+     glEnableVertexAttribArray(attrib_texcoord);
+diff --git a/src/graphics/shader.hpp b/src/graphics/shader.hpp
+index 0cb5d5d..98ee37d 100644
+--- a/src/graphics/shader.hpp
++++ b/src/graphics/shader.hpp
+@@ -31,6 +31,7 @@
+ #include <array>
+ 
+ #include <string>
++#include <cstdio>
+ #include <vector>
+ 
+ /** A simple non-templated base class. It is used to store some enums used in
+@@ -56,6 +57,10 @@ protected:
+     /** OpenGL's program id. */
+     GLuint m_program;
+     std::vector<std::shared_ptr<GLuint> > m_shaders;
++    /** Attribute locations fixed before linking, for shaders whose inputs
++     *  have no layout qualifier. The PS5 driver cannot be asked where they
++     *  are (glGetAttribLocation ends the process). */
++    std::vector<std::pair<GLuint, const char*> > m_attribute_bindings;
+ 
+     // ========================================================================
+     /** Ends recursion. */
+@@ -147,6 +152,9 @@ private:
+     /** End of recursive implementation of assignUniforms. */
+     void assignUniformsImpl()
+     {
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk:     uniform blocks of program %u\n", m_program);
++#endif
+         bindPoint("Matrices", 0);
+         bindPoint("LightingData", 1);
+         bindPoint("SPFogData", 2);
+@@ -357,10 +365,24 @@ public:
+     {
+         m_program = glCreateProgram();
+         loadAndAttachShader(args...);
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk:     linking program %u\n", m_program);
++#endif
++#ifndef __PROSPERO__
++        // The PS5 driver ends the process on glBindAttribLocation; there the
++        // locations are written into the shader source instead
++        // (ShaderFilesManager::loadShader).
++        for (auto& binding : m_attribute_bindings)
++            glBindAttribLocation(m_program, binding.first, binding.second);
++#endif
+         glLinkProgram(m_program);
+ 
+         GLint Result = GL_FALSE;
+         glGetProgramiv(m_program, GL_LINK_STATUS, &Result);
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk:     linked program %u: %s\n", m_program,
++                Result == GL_FALSE ? "failed" : "ok");
++#endif
+         if (Result == GL_FALSE)
+         {
+             int info_length;
+diff --git a/src/graphics/shader_files_manager.cpp b/src/graphics/shader_files_manager.cpp
+index 55eeda4..fd335de 100644
+--- a/src/graphics/shader_files_manager.cpp
++++ b/src/graphics/shader_files_manager.cpp
+@@ -18,6 +18,9 @@
+ #ifndef SERVER_ONLY
+ 
+ #include "graphics/shader_files_manager.hpp"
++
++#include <cstdio>
++#include <cstring>
+ #include "config/user_config.hpp"
+ #include "config/stk_config.hpp"
+ #include "graphics/central_settings.hpp"
+@@ -218,7 +221,39 @@ ShaderFilesManager::SharedShader ShaderFilesManager::loadShader
+ 
+     code << getHeader();
+ 
++#ifdef __PROSPERO__
++    // pointlight.vert gives its inputs no layout qualifiers, and the PS5
++    // driver ends the process both when asked where an attribute is
++    // (glGetAttribLocation) and when told before linking
++    // (glBindAttribLocation). The locations are written into the source
++    // instead, matching LightAttribute in lighting_passes.cpp.
++    if (StringUtils::getBasename(full_path) == "pointlight.vert")
++    {
++        std::ostringstream original;
++        readFile(full_path, original);
++        std::string text = original.str();
++        static const std::pair<const char*, const char*> inputs[] =
++        {
++            { "in vec3 Position;", "layout(location = 0) in vec3 Position;" },
++            { "in float Energy;", "layout(location = 1) in float Energy;" },
++            { "in vec3 Color;", "layout(location = 2) in vec3 Color;" },
++            { "in float Radius;", "layout(location = 3) in float Radius;" },
++            { "in vec4 Direction_scale_offset;",
++              "layout(location = 4) in vec4 Direction_scale_offset;" }
++        };
++        for (const auto& input : inputs)
++        {
++            const std::size_t at = text.find(input.first);
++            if (at != std::string::npos)
++                text.replace(at, strlen(input.first), input.second);
++        }
++        code << text;
++    }
++    else
++        readFile(full_path, code);
++#else
+     readFile(full_path, code);
++#endif
+ 
+     Log::info("ShaderFilesManager", "Compiling shader: %s",
+         full_path.c_str());
+@@ -227,6 +262,12 @@ ShaderFilesManager::SharedShader ShaderFilesManager::loadShader
+     int len                    = (int)source.size();
+     glShaderSource(*ss, 1, &source_pointer, &len);
+     glCompileShader(*ss);
++#ifdef __PROSPERO__
++    // Mesa's compiler on the console is young; a crash in it would otherwise
++    // look the same as one in whatever comes next.
++    fprintf(stderr, "stk:     compiled %s\n", full_path.c_str());
++    m_shader_sources[*ss] = source;
++#endif
+ 
+     GLint result = GL_FALSE;
+     glGetShaderiv(*ss, GL_COMPILE_STATUS, &result);
+diff --git a/src/graphics/shader_files_manager.hpp b/src/graphics/shader_files_manager.hpp
+index 93c522d..d0552bf 100644
+--- a/src/graphics/shader_files_manager.hpp
++++ b/src/graphics/shader_files_manager.hpp
+@@ -89,6 +89,20 @@ public:
+     SharedShader loadShader(const std::string& full_path, unsigned type);
+     // ------------------------------------------------------------------------
+     SharedShader getShaderFile(const std::string& file, unsigned type);
++#ifdef __PROSPERO__
++    // ------------------------------------------------------------------------
++    /** The complete source a shader was compiled from, includes expanded.
++     *  The console's driver ends the process when asked for a program's
++     *  uniforms, so the list is read from the source instead. */
++    const std::string& getShaderSource(GLuint shader) const
++    {
++        static const std::string empty;
++        auto it = m_shader_sources.find(shader);
++        return it == m_shader_sources.end() ? empty : it->second;
++    }
++private:
++    std::unordered_map<GLuint, std::string> m_shader_sources;
++#endif
+ 
+ };   // ShaderFilesManager
+ 
+diff --git a/src/graphics/sp/sp_dynamic_draw_call.cpp b/src/graphics/sp/sp_dynamic_draw_call.cpp
+index 3769c69..f79a4e7 100644
+--- a/src/graphics/sp/sp_dynamic_draw_call.cpp
++++ b/src/graphics/sp/sp_dynamic_draw_call.cpp
+@@ -56,9 +56,9 @@ SPDynamicDrawCall::SPDynamicDrawCall(scene::E_PRIMITIVE_TYPE pt,
+     glBufferData(GL_ARRAY_BUFFER, 4 * 48, NULL, GL_DYNAMIC_DRAW);
+     glGenBuffers(1, &m_ibo);
+     glBindBuffer(GL_ARRAY_BUFFER, m_ibo);
+-    glBufferData(GL_ARRAY_BUFFER, 44, NULL, GL_DYNAMIC_DRAW);
++    glBufferData(GL_ARRAY_BUFFER, SP_INSTANCE_SIZE, NULL, GL_DYNAMIC_DRAW);
+     SPInstancedData id = SPInstancedData(m_trans, 0.0f, 0.0f, 0.0f, 0);
+-    glBufferSubData(GL_ARRAY_BUFFER, 0, 44, &id);
++    glBufferSubData(GL_ARRAY_BUFFER, 0, SP_INSTANCE_SIZE, &id);
+     SPTextureManager::get()->increaseGLCommandFunctionCount(1);
+     SPTextureManager::get()->addGLCommandFunction
+         (std::bind(&SPDynamicDrawCall::initTextureDyDc, this));
+@@ -120,23 +120,24 @@ SPDynamicDrawCall::SPDynamicDrawCall(scene::E_PRIMITIVE_TYPE pt,
+     glBindBuffer(GL_ARRAY_BUFFER, m_ibo);
+     // Origin
+     glEnableVertexAttribArray(8);
+-    glVertexAttribPointer(8, 3, GL_FLOAT, GL_FALSE, 44, (void*)0);
++    glVertexAttribPointer(8, 3, GL_FLOAT, GL_FALSE, SP_INSTANCE_SIZE, (void*)0);
+     glVertexAttribDivisor(8, 1);
+     // Rotation (quaternion in 4 32bit floats)
+     glEnableVertexAttribArray(9);
+-    glVertexAttribPointer(9, 4, GL_FLOAT, GL_FALSE, 44, (void*)12);
++    glVertexAttribPointer(9, 4, GL_FLOAT, GL_FALSE, SP_INSTANCE_SIZE, (void*)12);
+     glVertexAttribDivisor(9, 1);
+     // Scale (3 half floats and .w unused)
+     glEnableVertexAttribArray(10);
+-    glVertexAttribPointer(10, 4, GL_HALF_FLOAT, GL_FALSE, 44, (void*)28);
++    glVertexAttribPointer(10, 4, GL_HALF_FLOAT, GL_FALSE, SP_INSTANCE_SIZE, (void*)28);
+     glVertexAttribDivisor(10, 1);
+     // Texture translation
+     glEnableVertexAttribArray(11);
+-    glVertexAttribPointer(11, 2, GL_SHORT, GL_TRUE, 44, (void*)36);
++    glVertexAttribPointer(11, 2, GL_SHORT, GL_TRUE, SP_INSTANCE_SIZE, (void*)36);
+     glVertexAttribDivisor(11, 1);
+     // Misc data (skinning offset and hue change)
+     glEnableVertexAttribArray(12);
+-    glVertexAttribIPointer(12, 2, GL_SHORT, 44, (void*)40);
++    glVertexAttribIPointer(12, 2, SP_INSTANCE_MISC_TYPE, SP_INSTANCE_SIZE,
++        (void*)40);
+     glVertexAttribDivisor(12, 1);
+     glBindVertexArray(0);
+     glBindBuffer(GL_ARRAY_BUFFER, 0);
+diff --git a/src/graphics/sp/sp_dynamic_draw_call.hpp b/src/graphics/sp/sp_dynamic_draw_call.hpp
+index 3f4f4a0..0b9decc 100644
+--- a/src/graphics/sp/sp_dynamic_draw_call.hpp
++++ b/src/graphics/sp/sp_dynamic_draw_call.hpp
+@@ -90,7 +90,7 @@ public:
+             SPInstancedData id = SPInstancedData(getAbsoluteTransformation(),
+                 m_texture_trans.X, m_texture_trans.Y, 0.0f, 0);
+             glBindBuffer(GL_ARRAY_BUFFER, m_ibo);
+-            glBufferSubData(GL_ARRAY_BUFFER, 0, 44, id.getData());
++            glBufferSubData(GL_ARRAY_BUFFER, 0, SP_INSTANCE_SIZE, id.getData());
+             glBindBuffer(GL_ARRAY_BUFFER, 0);
+         }
+         if (m_update_offset >= 0 && !m_vertices.empty())
+diff --git a/src/graphics/sp/sp_instanced_data.hpp b/src/graphics/sp/sp_instanced_data.hpp
+index edb8672..54df9a6 100644
+--- a/src/graphics/sp/sp_instanced_data.hpp
++++ b/src/graphics/sp/sp_instanced_data.hpp
+@@ -18,6 +18,7 @@
+ #ifndef HEADER_SP_INSTANCED_DATA_HPP
+ #define HEADER_SP_INSTANCED_DATA_HPP
+ 
++#include "graphics/gl_headers.hpp"
+ #include "mini_glm.hpp"
+ #include "utils/vec3.hpp"
+ #include <cassert>
+@@ -28,16 +29,28 @@ using namespace irr;
+ namespace SP
+ {
+ 
++// Bytes per instance record. On the PS5 the last two values (skinning offset
++// and hue) are 32-bit integers instead of 16-bit ones: its driver cannot fetch
++// 16-bit integer vertex attributes, so Mesa read every instance buffer back
++// and converted it on the CPU before each draw.
++#ifdef __PROSPERO__
++const unsigned SP_INSTANCE_SIZE = 48;
++const GLenum SP_INSTANCE_MISC_TYPE = GL_INT;
++#else
++const unsigned SP_INSTANCE_SIZE = 44;
++const GLenum SP_INSTANCE_MISC_TYPE = GL_SHORT;
++#endif
++
+ class SPInstancedData
+ {
+ private:
+-    char m_data[44];
++    char m_data[SP_INSTANCE_SIZE];
+ 
+ public:
+     // ------------------------------------------------------------------------
+     SPInstancedData()
+     {
+-        memset(m_data, 0, 44);
++        memset(m_data, 0, SP_INSTANCE_SIZE);
+     }
+     // ------------------------------------------------------------------------
+     SPInstancedData(const core::matrix4& model_mat,
+@@ -75,9 +88,15 @@ public:
+                 short(texture_trans_y * 32767.0f)
+             };
+         memcpy(m_data + 36, tm, 4);
++#ifdef __PROSPERO__
++        int misc[2] = { skinning_offset,
++            core::clamp(int(hue * 100.0f), 0, 100) };
++        memcpy(m_data + 40, misc, 8);
++#else
+         memcpy(m_data + 40, &skinning_offset, 2);
+         short hue_packed = short(core::clamp(int(hue * 100.0f), 0, 100));
+         memcpy(m_data + 42, &hue_packed, 2);
++#endif
+     }
+     // ------------------------------------------------------------------------
+     const void* getData() const                              { return m_data; }
+diff --git a/src/graphics/sp/sp_mesh_buffer.cpp b/src/graphics/sp/sp_mesh_buffer.cpp
+index 25050b5..7f21534 100644
+--- a/src/graphics/sp/sp_mesh_buffer.cpp
++++ b/src/graphics/sp/sp_mesh_buffer.cpp
+@@ -255,16 +255,16 @@ void SPMeshBuffer::recreateVAO(unsigned i)
+ #ifndef USE_GLES2
+     if (CVS->isARBBufferStorageUsable())
+     {
+-        glBufferStorage(GL_ARRAY_BUFFER, m_gl_instance_size[i] * 44, NULL,
++        glBufferStorage(GL_ARRAY_BUFFER, m_gl_instance_size[i] * SP_INSTANCE_SIZE, NULL,
+             GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+         m_ins_dat_mapped_ptr[i] = glMapBufferRange(GL_ARRAY_BUFFER, 0,
+-            m_gl_instance_size[i] * 44,
++            m_gl_instance_size[i] * SP_INSTANCE_SIZE,
+             GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+     }
+     else
+ #endif
+     {
+-        glBufferData(GL_ARRAY_BUFFER, m_gl_instance_size[i] * 44, NULL,
++        glBufferData(GL_ARRAY_BUFFER, m_gl_instance_size[i] * SP_INSTANCE_SIZE, NULL,
+             GL_DYNAMIC_DRAW);
+     }
+     glBindBuffer(GL_ARRAY_BUFFER, 0);
+@@ -354,23 +354,24 @@ void SPMeshBuffer::recreateVAO(unsigned i)
+     glBindBuffer(GL_ARRAY_BUFFER, m_ins_array[i]);
+     // Origin
+     glEnableVertexAttribArray(8);
+-    glVertexAttribPointer(8, 3, GL_FLOAT, GL_FALSE, 44, (void*)0);
++    glVertexAttribPointer(8, 3, GL_FLOAT, GL_FALSE, SP_INSTANCE_SIZE, (void*)0);
+     glVertexAttribDivisor(8, 1);
+     // Rotation (quaternion in 4 32bit floats)
+     glEnableVertexAttribArray(9);
+-    glVertexAttribPointer(9, 4, GL_FLOAT, GL_FALSE, 44, (void*)12);
++    glVertexAttribPointer(9, 4, GL_FLOAT, GL_FALSE, SP_INSTANCE_SIZE, (void*)12);
+     glVertexAttribDivisor(9, 1);
+     // Scale (3 half floats and .w unused)
+     glEnableVertexAttribArray(10);
+-    glVertexAttribPointer(10, 4, GL_HALF_FLOAT, GL_FALSE, 44, (void*)28);
++    glVertexAttribPointer(10, 4, GL_HALF_FLOAT, GL_FALSE, SP_INSTANCE_SIZE, (void*)28);
+     glVertexAttribDivisor(10, 1);
+     // Texture translation
+     glEnableVertexAttribArray(11);
+-    glVertexAttribPointer(11, 2, GL_SHORT, GL_TRUE, 44, (void*)36);
++    glVertexAttribPointer(11, 2, GL_SHORT, GL_TRUE, SP_INSTANCE_SIZE, (void*)36);
+     glVertexAttribDivisor(11, 1);
+     // Misc data (skinning offset and hue change)
+     glEnableVertexAttribArray(12);
+-    glVertexAttribIPointer(12, 2, GL_SHORT, 44, (void*)40);
++    glVertexAttribIPointer(12, 2, SP_INSTANCE_MISC_TYPE, SP_INSTANCE_SIZE,
++        (void*)40);
+     glVertexAttribDivisor(12, 1);
+ 
+     glBindVertexArray(0);
+@@ -406,16 +407,16 @@ void SPMeshBuffer::uploadInstanceData()
+         {
+             if (m_ins_dat_mapped_ptr[i])
+                 memcpy(m_ins_dat_mapped_ptr[i], m_ins_dat[i].data(),
+-                    m_ins_dat[i].size() * 44);
++                    m_ins_dat[i].size() * SP_INSTANCE_SIZE);
+         }
+         else
+         {
+             glBindBuffer(GL_ARRAY_BUFFER, m_ins_array[i]);
+             void* ptr = glMapBufferRange(GL_ARRAY_BUFFER, 0,
+-                m_ins_dat[i].size() * 44, GL_MAP_WRITE_BIT |
++                m_ins_dat[i].size() * SP_INSTANCE_SIZE, GL_MAP_WRITE_BIT |
+                 GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+             if (ptr)
+-                memcpy(ptr, m_ins_dat[i].data(), m_ins_dat[i].size() * 44);
++                memcpy(ptr, m_ins_dat[i].data(), m_ins_dat[i].size() * SP_INSTANCE_SIZE);
+             glUnmapBuffer(GL_ARRAY_BUFFER);
+             glBindBuffer(GL_ARRAY_BUFFER, 0);
+         }
+diff --git a/src/graphics/sp/sp_shader.cpp b/src/graphics/sp/sp_shader.cpp
+index ac76d4f..841c123 100644
+--- a/src/graphics/sp/sp_shader.cpp
++++ b/src/graphics/sp/sp_shader.cpp
+@@ -24,7 +24,9 @@
+ #include "guiengine/message_queue.hpp"
+ #include "utils/string_utils.hpp"
+ 
++#include <cstdio>
+ #include <map>
++#include <sstream>
+ 
+ namespace SP
+ {
+@@ -84,9 +86,16 @@ void SPShader::addShaderFile(const std::string& name, GLint shader_type,
+ void SPShader::linkShaderFiles(RenderPass rp)
+ {
+ #ifndef SERVER_ONLY
++#ifdef __PROSPERO__
++    fprintf(stderr, "stk:     linking %s pass %d\n", m_name.c_str(), (int)rp);
++#endif
+     glLinkProgram(m_program[rp]);
+     GLint result = GL_FALSE;
+     glGetProgramiv(m_program[rp], GL_LINK_STATUS, &result);
++#ifdef __PROSPERO__
++    fprintf(stderr, "stk:     linked %s: %s\n", m_name.c_str(),
++            result == GL_FALSE ? "failed" : "ok");
++#endif
+     if (result == GL_FALSE)
+     {
+         Log::error("SPShader", "Error when linking shader %s in pass %d",
+@@ -231,8 +240,6 @@ void SPShader::bindTextures(const std::array<GLuint, 6>& tex,
+ void SPShader::addAllUniforms(RenderPass rp)
+ {
+ #ifndef SERVER_ONLY
+-    GLint total_uniforms = 0;
+-    glGetProgramiv(m_program[rp], GL_ACTIVE_UNIFORMS, &total_uniforms);
+     static const std::map<GLenum, std::type_index> supported_types =
+         {
+             { GL_INT, std::type_index(typeid(int)) },
+@@ -242,6 +249,56 @@ void SPShader::addAllUniforms(RenderPass rp)
+             { GL_FLOAT_VEC3, std::type_index(typeid(irr::core::vector3df)) },
+             { GL_FLOAT_VEC2, std::type_index(typeid(irr::core::vector2df)) }
+         };
++#ifdef __PROSPERO__
++    // The console's OpenGL ends the process when asked for a program's
++    // uniforms: GL_ACTIVE_UNIFORMS and the GL_UNIFORM program interface both
++    // do, even on a two-uniform test program, while every other program query
++    // works. The declarations are read from the shader sources instead, and
++    // each one the linker kept is found with glGetUniformLocation, which does
++    // work. Arrays and samplers are skipped, as they are below.
++    static const std::map<std::string, GLenum> declared_types =
++        {
++            { "int", GL_INT }, { "float", GL_FLOAT }, { "mat4", GL_FLOAT_MAT4 },
++            { "vec4", GL_FLOAT_VEC4 }, { "vec3", GL_FLOAT_VEC3 },
++            { "vec2", GL_FLOAT_VEC2 }
++        };
++    for (auto& shader_file : m_shader_files)
++    {
++        std::istringstream source(
++            ShaderFilesManager::getInstance()->getShaderSource(*shader_file));
++        std::string word, type, name;
++        while (source >> word)
++        {
++            if (word != "uniform")
++                continue;
++            if (!(source >> type))
++                break;
++            if (type == "lowp" || type == "mediump" || type == "highp")
++            {
++                if (!(source >> type))
++                    break;
++            }
++            if (!(source >> name))
++                break;
++            if (name.empty() || name.back() != ';')
++                continue;           // an array, a block or a split line
++            name.pop_back();
++            auto declared = declared_types.find(type);
++            if (declared == declared_types.end() ||
++                m_uniforms[rp].find(name) != m_uniforms[rp].end())
++                continue;
++            GLint location = glGetUniformLocation(m_program[rp], name.c_str());
++            if (location == -1)
++                continue;           // declared, but not used by this program
++            m_uniforms[rp][name] = new SPUniformAssigner(
++                supported_types.at(declared->second), location);
++        }
++    }
++    fprintf(stderr, "stk:     %s: %d uniforms found in the source\n",
++            m_name.c_str(), (int)m_uniforms[rp].size());
++#else
++    GLint total_uniforms = 0;
++    glGetProgramiv(m_program[rp], GL_ACTIVE_UNIFORMS, &total_uniforms);
+ 
+     for (int i = 0; i < total_uniforms; i++)
+     {
+@@ -275,6 +332,7 @@ void SPShader::addAllUniforms(RenderPass rp)
+         m_uniforms[rp][name] = new SPUniformAssigner(ret->second, location);
+     }
+ #endif
++#endif
+ }   // addAllUniforms
+ 
+ // ----------------------------------------------------------------------------
+diff --git a/src/input/gamepad_config.cpp b/src/input/gamepad_config.cpp
+index 4733cff..3cb95aa 100644
+--- a/src/input/gamepad_config.cpp
++++ b/src/input/gamepad_config.cpp
+@@ -537,6 +537,14 @@ void GamepadConfig::initSDLMapping()
+         setBindingFromTuple(PA_LOOK_BACK, actions_map.at(SDL_CONTROLLER_BUTTON_Y));
+         // Split joycons will only have one minus button (left joycon)
+         setBindingFromTuple(PA_RESCUE, actions_map.at(SDL_CONTROLLER_BUTTON_LEFTSTICK));
++#elif defined(__PROSPERO__)
++        // Racing-game layout for the DualSense: Cross accelerates, Square
++        // brakes, Circle fires, Triangle looks back, the touchpad rescues.
++        setBindingFromTuple(PA_ACCEL, actions_map.at(SDL_CONTROLLER_BUTTON_A));
++        setBindingFromTuple(PA_BRAKE, actions_map.at(SDL_CONTROLLER_BUTTON_X));
++        setBindingFromTuple(PA_FIRE, actions_map.at(SDL_CONTROLLER_BUTTON_B));
++        setBindingFromTuple(PA_LOOK_BACK, actions_map.at(SDL_CONTROLLER_BUTTON_Y));
++        setBindingFromTuple(PA_RESCUE, actions_map.at(SDL_CONTROLLER_BUTTON_BACK));
+ #else
+         setBindingFromTuple(PA_ACCEL, actions_map.at(SDL_CONTROLLER_BUTTON_Y));
+         setBindingFromTuple(PA_BRAKE, actions_map.at(SDL_CONTROLLER_BUTTON_X));
+diff --git a/src/input/sdl_controller.cpp b/src/input/sdl_controller.cpp
+index 19534d8..c6aeec0 100644
+--- a/src/input/sdl_controller.cpp
++++ b/src/input/sdl_controller.cpp
+@@ -46,6 +46,25 @@ SDLController::SDLController(int device_id)
+     m_haptic = NULL;
+     m_id = -1;
+ 
++#ifdef __PROSPERO__
++    {
++        // The PS5 port of SDL ships a mapping that puts confirm on Options and
++        // back on Cross. The raw button order of the DualSense is the standard
++        // one (OliSe Player reads it directly), so it is mapped as such here,
++        // before the controller is opened: Cross confirms, Circle goes back.
++        char guid[64] = {};
++        SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(device_id),
++                                  guid, sizeof(guid));
++        std::string mapping = std::string(guid) + ",PS5 Controller,"
++            "a:b0,b:b1,x:b2,y:b3,back:b4,guide:b5,start:b6,"
++            "leftstick:b7,rightstick:b8,leftshoulder:b9,rightshoulder:b10,"
++            "dpup:b11,dpdown:b12,dpleft:b13,dpright:b14,"
++            "leftx:a0,lefty:a1,rightx:a2,righty:a3,"
++            "lefttrigger:a4,righttrigger:a5,";
++        int added = SDL_GameControllerAddMapping(mapping.c_str());
++        Log::info("SDLController", "PS5 mapping for %s: %d", guid, added);
++    }
++#endif
+     if (SDL_IsGameController(device_id))
+     {
+         m_game_controller = SDL_GameControllerOpen(device_id);
+diff --git a/src/io/file_manager.cpp b/src/io/file_manager.cpp
+index 6c6c7c8..ae9f4f5 100644
+--- a/src/io/file_manager.cpp
++++ b/src/io/file_manager.cpp
+@@ -139,6 +139,12 @@ FileManager* file_manager = 0;
+  */
+ FileManager::FileManager()
+ {
++#ifdef __PROSPERO__
++#  define STK_PS5_FM(name) fprintf(stderr, "stk:     %s\n", name)
++#else
++#  define STK_PS5_FM(name) do { } while (0)
++#endif
++    STK_PS5_FM("resetSubdir");
+     m_root_dirs.clear();
+     resetSubdir();
+ #ifdef __APPLE__
+@@ -153,7 +159,9 @@ FileManager::FileManager()
+     chdir( buffer );
+ #endif
+ 
++    STK_PS5_FM("createFileSystem");
+     m_file_system = irr::io::createFileSystem();
++    STK_PS5_FM("file system created");
+ 
+ #ifdef ANDROID
+     AssetsAndroid android_assets(this);
+@@ -170,17 +178,49 @@ FileManager::FileManager()
+     // to define the working directory when debugging, it works automatically.
+     std::string root_dir;
+     const std::string version = std::string("supertuxkart.") + STK_VERSION;
++    STK_PS5_FM("locating the data directory");
++    STK_PS5_FM("getExecName");
++#ifdef __PROSPERO__
++    {
++        const std::string &n = CommandLine::getExecName();
++        fprintf(stderr, "stk:     exec name is '%s' (%zu chars)\n",
++                n.c_str(), n.size());
++    }
++#endif
++    STK_PS5_FM("fileExists on the exec name");
++#ifdef __PROSPERO__
++    /* The executable name is empty on this platform: a title is not handed an
++       argv[0]. There is nothing to look up, so the call is skipped and
++       exe_path stays empty, which the code right after this already handles. */
++    STK_PS5_FM("skipping the exec name lookup");
++    if (false)
++#else
+     if (fileExists(CommandLine::getExecName()))
++#endif
+     {
+         exe_path = StringUtils::getPath(CommandLine::getExecName());
+     }
++    STK_PS5_FM("building exe_path");
+     if(exe_path.size()==0 || exe_path[exe_path.size()-1]!='/')
+         exe_path += "/";
++    STK_PS5_FM("reading SUPERTUXKART_DATADIR");
+     if ( getenv ( "SUPERTUXKART_DATADIR" ) != NULL )
+         root_dir = std::string(getenv("SUPERTUXKART_DATADIR"))+"/data/" ;
+ #ifdef __APPLE__
+     else if( macSetBundlePathIfRelevant( root_dir ) ) { root_dir = root_dir + "data/"; }
+ #endif
++#ifdef __PROSPERO__
++    /* A PS5 title does not start in its own folder, and which path that folder
++       turns up under depends on how it was mounted, so each candidate is
++       tried. ShadowMountPlus uses /system_ex/app/<title>; a packaged title
++       gets /app0. */
++    else if(fileExists("/app0/data/", version))
++        root_dir = "/app0/data/";
++    else if(fileExists("/system_ex/app/PPSA69421/data/", version))
++        root_dir = "/system_ex/app/PPSA69421/data/";
++    else if(fileExists("/mnt/sandbox/PPSA69421_000/app0/data/", version))
++        root_dir = "/mnt/sandbox/PPSA69421_000/app0/data/";
++#endif
+ #ifdef __SWITCH__
+     else if(fileExists("sdmc:/stk-data/", version))
+         root_dir = "sdmc:/stk-data/";
+@@ -224,6 +264,7 @@ FileManager::FileManager()
+         // fatal will exit the application
+     }
+ 
++    STK_PS5_FM("addRootDirs");
+     addRootDirs(root_dir);
+ 
+     std::string assets_dir;
+@@ -261,8 +302,11 @@ FileManager::FileManager()
+         addRootDirs(assets_dir);
+     }
+ 
++    STK_PS5_FM("checkAndCreateConfigDir");
+     checkAndCreateConfigDir();
++    STK_PS5_FM("checkAndCreateAddonsDir");
+     checkAndCreateAddonsDir();
++    STK_PS5_FM("checkAndCreateScreenshotDir");
+     checkAndCreateScreenshotDir();
+     checkAndCreateReplayDir();
+     checkAndCreateCachedTexturesDir();
+@@ -532,6 +576,11 @@ FileManager::~FileManager()
+  */
+ bool FileManager::fileExists(const std::string& path) const
+ {
++    /* An empty path has no file behind it, and Irrlicht's existFile does not
++       survive being handed one: a PS5 title gets no argv[0], so the executable
++       name is empty and this is the first thing asked about it. */
++    if (path.empty()) return false;
++
+ #ifdef DEBUG
+     bool exists = m_file_system->existFile(path.c_str());
+     if(exists) return true;
+diff --git a/src/io/rich_presence.cpp b/src/io/rich_presence.cpp
+index 0466558..7f6b4d3 100644
+--- a/src/io/rich_presence.cpp
++++ b/src/io/rich_presence.cpp
+@@ -21,7 +21,9 @@
+ #include "online/request_manager.hpp"
+ #include "online/http_request.hpp"
+ 
+-#if defined(__SWITCH__) || defined(MOBILE_STK) || defined(SERVER_ONLY)
++// Rich presence talks to a Discord client over a local socket. A PS5 title has
++// no such client, and the lookup reads the environment and the parent process.
++#if defined(__SWITCH__) || defined(MOBILE_STK) || defined(SERVER_ONLY) || defined(__PROSPERO__)
+ #define DISABLE_RPC
+ #endif
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index 8e98e73..d78773e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1019,6 +1019,20 @@ int handleCmdLinePreliminary()
+         UserConfigParams::m_texture_compression = true;
+     else if (CommandLine::has("--disable-texture-compression"))
+         UserConfigParams::m_texture_compression = false;
++    // Mipmaps made by STK's texture threads instead of glGenerateMipmap: the
++    // PS5 driver builds them on the CPU in the main thread, after waiting for
++    // the GPU to finish with the texture, once for every texture a track
++    // loads.
++    UserConfigParams::m_hq_mipmap = true;
++    // Sound was switched off here for an experiment; it was not the cause of
++    // the overworld bubble stall, so the saved settings are restored to on.
++    UserConfigParams::m_sfx = true;
++    UserConfigParams::m_music = true;
++    // Dynamic lights (the deferred renderer) on again: their stalls came from
++    // unbuffered log writes (decision 9 in the port's log). Set here while
++    // the options screen hangs on the PS5; this overrides the player's choice
++    // until then.
++    UserConfigParams::m_dynamic_lights = true;
+     // screen space ambient occluison
+     if (CommandLine::has("--enable-ssao"))
+         UserConfigParams::m_ssao = true;
+@@ -1902,14 +1916,55 @@ int handleCmdLine(bool has_server_config, bool has_parent_process)
+ //=============================================================================
+ /** Initialises the minimum number of managers to get access to user_config.
+  */
++#ifdef __PROSPERO__
++/* Each step of start-up says so before it runs, so a crash names the call it
++   happened in. The console gives no backtrace, and this folder is the only
++   place a native title can leave a trace behind. */
++#  define STK_PS5_STEP(name) fprintf(stderr, "stk:   %s\n", name)
++#else
++#  define STK_PS5_STEP(name) do { } while (0)
++#endif
++
+ void initUserConfig()
+ {
++    STK_PS5_STEP("new FileManager");
+     file_manager = new FileManager();
++    STK_PS5_STEP("new UserConfig");
+     user_config  = new UserConfig();     // needs file_manager
++    STK_PS5_STEP("loadConfig");
+     user_config->loadConfig();
++#ifdef __PROSPERO__
++    // The PS5's own keyboard needs SDL's video driver, which a title cannot
++    // run, so text fields use STK's on-screen keyboard, as on Android.
++    UserConfigParams::m_screen_keyboard = 1;
++    // Compressing textures happens on the CPU when a track is first loaded,
++    // which made that load take minutes. The PS5 has the memory to keep them
++    // uncompressed.
++    UserConfigParams::m_texture_compression = false;
++    // Mipmaps made by STK's texture threads instead of glGenerateMipmap: the
++    // PS5 driver builds them on the CPU in the main thread, after waiting for
++    // the GPU to finish with the texture, once for every texture a track
++    // loads.
++    UserConfigParams::m_hq_mipmap = true;
++    // Sound was switched off here for an experiment; it was not the cause of
++    // the overworld bubble stall, so the saved settings are restored to on.
++    UserConfigParams::m_sfx = true;
++    UserConfigParams::m_music = true;
++    // Dynamic lights (the deferred renderer) on again: their stalls came from
++    // unbuffered log writes (decision 9 in the port's log). Set here while
++    // the options screen hangs on the PS5; this overrides the player's choice
++    // until then.
++    UserConfigParams::m_dynamic_lights = true;
++    // No internet on the PS5 for now: curl's start-up ends the process, so
++    // the game runs as if the player declined access. Local races and LAN
++    // play do not need it. This also keeps the permission question away.
++    UserConfigParams::m_internet_status =
++        Online::RequestManager::IPERM_NOT_ALLOWED;
++#endif
+     // Some parts of the file manager needs user config (paths for models
+     // depend on artist debug flag). So init the rest of the file manager
+     // after reading the user config file.
++    STK_PS5_STEP("file_manager->init");
+     file_manager->init();
+     if (UserConfigParams::m_language.toString() != "system")
+     {
+@@ -1922,7 +1977,9 @@ void initUserConfig()
+ #endif
+     }
+ 
++    STK_PS5_STEP("new Translations");
+     translations            = new Translations();   // needs file_manager
++    STK_PS5_STEP("new STKConfig");
+     stk_config              = new STKConfig();      // in case of --stk-config
+                                                     // command line parameters
+ }   // initUserConfig
+@@ -1952,7 +2009,9 @@ void clearGlobalVariables()
+ void initRest()
+ {
+     GUIEngine::reserveLoadingIcons(2);
++    STK_PS5_STEP("SP::setMaxTextureSize");
+     SP::setMaxTextureSize();
++    STK_PS5_STEP("new IrrDriver");
+     irr_driver = new IrrDriver();
+ 
+     if (irr_driver->getDevice() == NULL)
+@@ -1960,9 +2019,11 @@ void initRest()
+         Log::fatal("main", "Couldn't initialise irrlicht device. Quitting.\n");
+     }
+ 
++    STK_PS5_STEP("StkTime::init");
+     StkTime::init();   // grabs the timer object from the irrlicht device
+ 
+     // Now create the actual non-null device in the irrlicht driver
++    STK_PS5_STEP("irr_driver->initDevice");
+     irr_driver->initDevice();
+ 
+     // Init GUI
+@@ -1975,8 +2036,10 @@ void initRest()
+         exit(0);
+     }
+ 
++    STK_PS5_STEP("new FontManager");
+     font_manager = new FontManager(); // Fonts are loaded in GUIEngine::init
+ 
++    STK_PS5_STEP("new InputManager");
+     input_manager = new InputManager();
+ #ifdef __SWITCH__
+     input_manager->addJoystick();
+@@ -1984,7 +2047,9 @@ void initRest()
+     // Get into menu mode initially.
+     input_manager->setMode(InputManager::MENU);
+     // Input manager set first so it recieves SDL joystick event
++    STK_PS5_STEP("GUIEngine::init");
+     GUIEngine::init(device, driver, StateManager::get());
++    STK_PS5_STEP("GUIEngine::renderLoading");
+     GUIEngine::renderLoading(true, true, false);
+     GUIEngine::flushRenderLoading(true/*launching*/);
+ 
+@@ -2007,6 +2072,7 @@ void initRest()
+     }
+ #endif
+ 
++    STK_PS5_STEP("initMusicFiles");
+     stk_config->initMusicFiles();
+     // This only initialises the non-network part of the add-ons manager. The
+     // online section of the add-ons manager will be initialised from a
+@@ -2018,30 +2084,41 @@ void initRest()
+         // Need to load shader after downloading assets as it reads prefilled
+         // textures
+         if (CVS->isGLSL())
++        {
++            STK_PS5_STEP("SP::loadShaders");
+             SP::loadShaders();
++        }
++        STK_PS5_STEP("new AddonsManager");
+         addons_manager = new AddonsManager();
+     }
+ #endif
++    STK_PS5_STEP("ProfileManager::create");
+     Online::ProfileManager::create();
+ 
+     // The request manager will start the login process in case of a saved
+     // session, so we need to read the main data from the players.xml file.
+     // The rest will be read later (since the rest needs the unlock- and
+     // achievement managers to be created, which can only be created later).
++    STK_PS5_STEP("PlayerManager::create");
+     PlayerManager::create();
++    STK_PS5_STEP("startNetworkThread");
+     Online::RequestManager::get()->startNetworkThread();
+ #ifndef SERVER_ONLY
++    STK_PS5_STEP("NewsManager::get");
+     if (!GUIEngine::isNoGraphics())
+         NewsManager::get();   // this will create the news manager
+ #endif
+ 
++    STK_PS5_STEP("new MusicManager");
+     music_manager = new MusicManager();
++    STK_PS5_STEP("SFXManager::create");
+     SFXManager::create();
+     // The order here can be important, e.g. KartPropertiesManager needs
+     // defaultKartProperties, which are defined in stk_config.
+     history                 = new History              ();
+     ReplayPlay::create();
+     ReplayRecorder::create();
++    STK_PS5_STEP("new MaterialManager");
+     material_manager        = new MaterialManager      ();
+     track_manager           = new TrackManager         ();
+     kart_properties_manager = new KartPropertiesManager();
+@@ -2052,6 +2129,7 @@ void initRest()
+ 
+     // The maximum texture size can not be set earlier, since
+     // e.g. the background image needs to be loaded in high res.
++    STK_PS5_STEP("setMaxTextureSize");
+     irr_driver->setMaxTextureSize();
+     if (!UserConfigParams::m_disable_addon_karts)
+     {
+@@ -2065,10 +2143,12 @@ void initRest()
+     }
+ 
+     {
++        STK_PS5_STEP("kart_characteristics.xml");
+         XMLNode characteristicsNode(file_manager->getAsset("kart_characteristics.xml"));
+         kart_properties_manager->loadCharacteristics(&characteristicsNode);
+     }
+ 
++    STK_PS5_STEP("loadTrackList");
+     track_manager->loadTrackList();
+     stk_config->validateBenchmarkReplays();
+     music_manager->addMusicToTracks();
+@@ -2104,6 +2184,29 @@ void initRest()
+ #endif
+ }   // initRest
+ 
++#ifdef __PROSPERO__
++//=============================================================================
++extern "C" int sceUserServiceInitialize(void* params);
++extern "C" int sceUserServiceGetInitialUser(int* user_id);
++extern "C" int sceUserServiceGetUserName(int user_id, char* name, size_t size);
++
++/** The name of the PS5 account that started the game, or "Player" when the
++ *  console does not say. */
++static core::stringw ps5AccountName()
++{
++    (void)sceUserServiceInitialize(NULL);   // SDL may have done this already
++    int user_id = -1;
++    char name[32] = {};
++    if (sceUserServiceGetInitialUser(&user_id) == 0 &&
++        sceUserServiceGetUserName(user_id, name, sizeof(name)) == 0 &&
++        name[0] != '\0')
++    {
++        return StringUtils::utf8ToWide(name);
++    }
++    return L"Player";
++}   // ps5AccountName
++#endif
++
+ //=============================================================================
+ void askForInternetPermission()
+ {
+@@ -2222,6 +2325,12 @@ int ios_main(int argc, char *argv[])
+ int main(int argc, char *argv[])
+ #endif
+ {
++#ifdef __PROSPERO__
++    /* The log is already open by now (ps5-support.c does it before main);
++       this says the entry point was reached, which tells a crash in static
++       initialisation apart from one in the game's own startup. */
++    fprintf(stderr, "stk: main() reached, argc=%d\n", argc);
++#endif
+ #ifdef __SWITCH__
+     constexpr devoptab_t dotab_stdout = {
+         .name    = "con",
+@@ -2282,6 +2391,9 @@ int main(int argc, char *argv[])
+     {
+         std::string s, server_config;
+ 
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk: handleCmdLineOutputModifier\n");
++#endif
+         handleCmdLineOutputModifier();
+ 
+         if (CommandLine::has("--server-config", &s))
+@@ -2310,20 +2422,31 @@ int main(int argc, char *argv[])
+         // Init the minimum managers so that user config exists, then
+         // handle all command line options that do not need (or must
+         // not have) other managers initialised:
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk: initUserConfig\n");
++#endif
+         initUserConfig();
+ 
+         CommandLine::addArgsFromUserConfig();
+ 
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk: handleCmdLinePreliminary\n");
++#endif
+         handleCmdLinePreliminary();
+ 
+         // ServerConfig will use stk_config for server version testing
+         stk_config->load(file_manager->getAsset("stk_config.xml"));
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk: initSystemIP\n");
++#endif
+         NetworkConfig::initSystemIP();
+         // Client port depends on user config file and stk_config
++        STK_PS5_STEP("initClientPort");
+         NetworkConfig::get()->initClientPort();
+         bool no_graphics = !CommandLine::has("--graphical-server");
+ 
+ #ifndef SERVER_ONLY
++        STK_PS5_STEP("TipsManager::create");
+         TipsManager::create();
+ #endif
+ 
+@@ -2341,7 +2464,10 @@ int main(int argc, char *argv[])
+             NetworkConfig::get()->setIsServer(true);
+         }
+         else
++        {
++            STK_PS5_STEP("loadServerConfig");
+             ServerConfig::loadServerConfig();
++        }
+ 
+         if (CommandLine::has("--wan-server", &s))
+         {
+@@ -2371,11 +2497,14 @@ int main(int argc, char *argv[])
+             ServerConfig::m_validating_player = false;
+         }
+ 
++        STK_PS5_STEP("profiler.init");
+         if (!GUIEngine::isNoGraphics())
+             profiler.init();
+         // Create the story mode timer with empty setting first, it will
+         // be reset later after story mode status and player manager is loaded
++        STK_PS5_STEP("new StoryModeTimer");
+         story_mode_timer = new StoryModeTimer();
++        STK_PS5_STEP("initRest");
+         initRest();
+ 
+ #ifdef ENABLE_WIIUSE
+@@ -2391,12 +2520,17 @@ int main(int argc, char *argv[])
+             has_parent_process = true;
+         }
+         else
++        {
++            STK_PS5_STEP("new MainLoop");
+             main_loop = new MainLoop(0/*parent_pid*/);
++        }
+ 
+         // Set of loading steps common between the first game launch and
+         // reloading to apply a new resolution.
++        STK_PS5_STEP("irr_driver->commonInit");
+         irr_driver->commonInit();
+ 
++        STK_PS5_STEP("OfficialKarts::load");
+         OfficialKarts::load();
+         handleXmasMode();
+         handleEasterEarMode();
+@@ -2404,24 +2538,28 @@ int main(int argc, char *argv[])
+         // Needs the kart and track directories to load potential challenges
+         // in those dirs, so it can only be created after reading tracks
+         // and karts.
++        STK_PS5_STEP("new UnlockManager");
+         unlock_manager = new UnlockManager();
+         AchievementsManager::create();
+ 
+         // Reading the rest of the player data needs the unlock manager to
+         // initialise the game slots of all players and the AchievementsManager
+         // to initialise the AchievementsStatus, so it is done only now.
++        STK_PS5_STEP("initRemainingData");
+         PlayerManager::get()->initRemainingData();
+ 
+         GUIEngine::addLoadingIcon( irr_driver->getTexture(FileManager::GUI_ICON,
+                                                           "gui_lock.png"  ) );
+ 
+         //handleCmdLine() needs InitTuxkart() so it can't be called first
++        STK_PS5_STEP("handleCmdLine");
+         if (!handleCmdLine(!server_config.empty(), has_parent_process))
+             exit(0);
+ 
+ #ifndef SERVER_ONLY
+         if (!GUIEngine::isNoGraphics())
+         {
++            STK_PS5_STEP("checkInstalledAddons");
+             addons_manager->checkInstalledAddons();
+ 
+             // Load addons.xml to get info about add-ons even when not
+@@ -2568,6 +2706,18 @@ int main(int argc, char *argv[])
+             }
+ 
+ #ifndef SERVER_ONLY // No GUI files in server builds
++#ifdef __PROSPERO__
++            // On the first start the player is named after the PS5 account
++            // instead of being asked: the name can still be changed in STK,
++            // and cancelling the question would otherwise close the game.
++            if (PlayerManager::get()->getNumPlayers() == 0)
++            {
++                PlayerProfile* player =
++                    PlayerManager::get()->addNewPlayer(ps5AccountName());
++                PlayerManager::get()->setCurrentPlayer(player);
++                PlayerManager::get()->save();
++            }
++#endif
+             // If there is a current player, it was saved in the config file,
+             // so we immediately start the main menu (unless it was requested
+             // to always show the login screen). Otherwise show the login
+diff --git a/src/main_loop.cpp b/src/main_loop.cpp
+index b940e52..1b8204c 100644
+--- a/src/main_loop.cpp
++++ b/src/main_loop.cpp
+@@ -19,6 +19,14 @@
+ 
+ #include "main_loop.hpp"
+ 
++#include <cstdio>
++#include <ctime>
++
++#ifdef __PROSPERO__
++// ps5-support.c: direct memory in the log.
++extern "C" void ps5_log_memory(void);
++#endif
++
+ #ifdef MOBILE_STK
+ #include "addons/addons_manager.hpp"
+ #endif
+@@ -456,6 +464,46 @@ void MainLoop::run()
+ 
+         PROFILER_PUSH_CPU_MARKER("Main loop", 0xFF, 0x00, 0xF7);
+         TimePoint frame_start = std::chrono::steady_clock::now();
++#ifdef __PROSPERO__
++        {
++            // Frame rate in the log every five seconds: the average, and the
++            // slowest frame, which is what a stutter looks like.
++            static TimePoint report_start = frame_start, previous = frame_start;
++            static unsigned frames = 0;
++            static double slowest = 0.0;
++            const double frame = std::chrono::duration<double>(
++                frame_start - previous).count();
++            previous = frame_start;
++            if (frame > slowest)
++                slowest = frame;
++            frames++;
++            const double elapsed = std::chrono::duration<double>(
++                frame_start - report_start).count();
++            if (elapsed >= 5.0)
++            {
++                // CPU time of the process and of this thread, measured here:
++                // the console's exporter reported a few percent while frames
++                // took seconds, which a CPU-bound driver would not do.
++                static double process_before = 0.0, thread_before = 0.0;
++                struct timespec ts;
++                clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
++                const double process_now = ts.tv_sec + ts.tv_nsec / 1e9;
++                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++                const double thread_now = ts.tv_sec + ts.tv_nsec / 1e9;
++                fprintf(stderr, "stk: %.1f fps over %.0f s, slowest frame %.0f ms, "
++                        "cpu %.0f%% main thread, %.0f%% all threads (of one core)\n",
++                        frames / elapsed, elapsed, slowest * 1000.0,
++                        (thread_now - thread_before) / elapsed * 100.0,
++                        (process_now - process_before) / elapsed * 100.0);
++                process_before = process_now;
++                thread_before = thread_now;
++                ps5_log_memory();
++                report_start = frame_start;
++                frames = 0;
++                slowest = 0.0;
++            }
++        }
++#endif
+ 
+         left_over_time += getLimitedDt();
+         int num_steps   = stk_config->time2Ticks(left_over_time);
+diff --git a/src/network/network_config.cpp b/src/network/network_config.cpp
+index 6d3f676..561e51f 100644
+--- a/src/network/network_config.cpp
++++ b/src/network/network_config.cpp
+@@ -16,6 +16,9 @@
+ //  along with this program; if not, write to the Free Software
+ //  Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ 
++#ifdef __PROSPERO__
++#include <cstdio>
++#endif
+ #include "network/network_config.hpp"
+ #include "config/stk_config.hpp"
+ #include "config/user_config.hpp"
+@@ -52,13 +55,13 @@
+ #  pragma comment(lib, "dnsapi.lib")
+ #endif
+ #else
+-#ifndef __SWITCH__
++#if !defined(__SWITCH__) && !defined(__PROSPERO__)
+ #  include <arpa/nameser.h>
+ #  include <arpa/nameser_compat.h>
+ #endif
+ #  include <netdb.h>
+ #  include <netinet/in.h>
+-#ifndef __SWITCH__
++#if !defined(__SWITCH__) && !defined(__PROSPERO__)
+ #  include <resolv.h>
+ #endif
+ #endif
+@@ -102,11 +105,20 @@ void NetworkConfig::initSystemIP()
+         Log::error("NetworkConfig", "Could not initialize enet.");
+         return;
+     }
++#ifdef __PROSPERO__
++#  define STK_PS5_NET(name) fprintf(stderr, "stk:   %s\n", name)
++#else
++#  define STK_PS5_NET(name) do { } while (0)
++#endif
+     ENetAddress eaddr = {};
+     setIPv6Socket(0);
++    STK_PS5_NET("IPv4 socket");
+     auto ipv4 = std::unique_ptr<Network>(new Network(1, 1, 0, 0, &eaddr));
++    STK_PS5_NET(ipv4 && ipv4->getENetHost() ? "IPv4 works" : "IPv4 refused");
+     setIPv6Socket(1);
++    STK_PS5_NET("IPv6 socket");
+     auto ipv6 = std::unique_ptr<Network>(new Network(1, 1, 0, 0, &eaddr));
++    STK_PS5_NET(ipv6 && ipv6->getENetHost() ? "IPv6 works" : "IPv6 refused");
+     setIPv6Socket(0);
+     if (ipv4 && ipv4->getENetHost())
+         m_system_ipv4 = true;
+@@ -570,6 +582,13 @@ void NetworkConfig::fillStunList(std::vector<std::pair<std::string, int> >* l,
+     env->DeleteLocalRef(class_native_activity);
+     env->DeleteLocalRef(native_activity);
+     g_list = NULL;
++#elif defined(__PROSPERO__)
++    /* The PS5 payload SDK has no DNS resolver: res_query and the ns_* helpers
++       below do not exist on this target, the way they do not on the Switch.
++       STUN lookup is only used to reach the online lobby, which a jailbroken
++       console cannot sign in to anyway, so the list is left empty. */
++    (void)dns;
++    Log::info("NetworkConfig", "STUN lookup is not available on this platform");
+ #elif defined(DNS_C)
+     int err = 0;
+     struct dns_socket* so = NULL;
+diff --git a/src/network/protocols/connect_to_server.cpp b/src/network/protocols/connect_to_server.cpp
+index 4c3fe8f..252dbfc 100644
+--- a/src/network/protocols/connect_to_server.cpp
++++ b/src/network/protocols/connect_to_server.cpp
+@@ -58,13 +58,13 @@
+ #  pragma comment(lib, "dnsapi.lib")
+ #endif
+ #else
+-#ifndef __SWITCH__
++#if !defined(__SWITCH__) && !defined(__PROSPERO__)
+ #  include <arpa/nameser.h>
+ #  include <arpa/nameser_compat.h>
+ #endif
+ #  include <netdb.h>
+ #  include <netinet/in.h>
+-#ifndef __SWITCH__
++#if !defined(__SWITCH__) && !defined(__PROSPERO__)
+ #  include <resolv.h>
+ #endif
+ #endif
+@@ -694,6 +694,12 @@ bool ConnectToServer::detectPort()
+             break;
+     }
+ 
++#elif defined(__PROSPERO__)
++    /* No DNS resolver on this target, same as on the Switch. Port detection
++       reads a TXT record to find a server behind a non-default port; without
++       it the configured port is used, which is what a LAN game uses anyway. */
++    Log::info("ConnectToServer",
++        "DNS port detection is not available on this platform");
+ #elif defined(DNS_C)
+     const std::string& utf8name = StringUtils::wideToUtf8(m_server->getName());
+ 
+diff --git a/src/online/http_request_curl.cpp b/src/online/http_request_curl.cpp
+index 6aafc04..2658dfc 100644
+--- a/src/online/http_request_curl.cpp
++++ b/src/online/http_request_curl.cpp
+@@ -28,7 +28,14 @@ typedef double progress_t;
+ // ============================================================================
+ bool Online::globalHTTPRequestInit()
+ {
++#ifdef __PROSPERO__
++    // Internet access is switched off on the PS5 for now (see main.cpp), and
++    // starting curl starts OpenSSL, which ended the process during its own
++    // start-up. Nothing sends a request while access is not allowed.
++    return false;
++#else
+     return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
++#endif
+ }   // globalHTTPRequestInit
+ 
+ // ============================================================================
+diff --git a/src/online/link_helper.cpp b/src/online/link_helper.cpp
+index 671dade..449c3a2 100644
+--- a/src/online/link_helper.cpp
++++ b/src/online/link_helper.cpp
+@@ -68,7 +68,8 @@ namespace Online
+ 
+     bool LinkHelper::isSupported()
+     {
+-#ifdef SERVER_ONLY
++        // A PS5 title has no browser to hand a link to.
++#if defined(SERVER_ONLY) || defined(__PROSPERO__)
+         return false;
+ #else
+ 
+@@ -85,7 +86,7 @@ namespace Online
+ 
+     void LinkHelper::openURL(const std::string& url)
+     {
+-#ifndef SERVER_ONLY
++#if !defined(SERVER_ONLY) && !defined(__PROSPERO__)
+ 
+ #if defined(_WIN32)
+         ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+diff --git a/src/online/request_manager.cpp b/src/online/request_manager.cpp
+index 0c39bce..97b7b9d 100644
+--- a/src/online/request_manager.cpp
++++ b/src/online/request_manager.cpp
+@@ -20,6 +20,8 @@
+ 
+ #include "online/request_manager.hpp"
+ 
++#include <cstdio>
++
+ #include "config/player_manager.hpp"
+ #include "config/user_config.hpp"
+ #include "states_screens/state_manager.hpp"
+@@ -98,7 +100,13 @@ namespace Online
+      */
+     void RequestManager::startNetworkThread()
+     {
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk:     starting the network thread\n");
++#endif
+         m_thread = std::thread(std::bind(mainLoop, this));
++#ifdef __PROSPERO__
++        fprintf(stderr, "stk:     network thread started\n");
++#endif
+         // In case that login id was not saved (or first start of stk),
+         // current player would not be defined at this stage.
+         PlayerProfile *player = PlayerManager::getCurrentPlayer();
+diff --git a/src/states_screens/options/options_screen_general.cpp b/src/states_screens/options/options_screen_general.cpp
+index b66b4ad..d4fe086 100644
+--- a/src/states_screens/options/options_screen_general.cpp
++++ b/src/states_screens/options/options_screen_general.cpp
+@@ -63,6 +63,10 @@ void OptionsScreenGeneral::init()
+                                      ==RequestManager::IPERM_ALLOWED );
+ 
+     setInternetCheckboxes(internet_enabled->getState());
++#ifdef __PROSPERO__
++    // Internet access is not available on the PS5 yet; see main.cpp.
++    internet_enabled->setActive(false);
++#endif
+ 
+     CheckBoxWidget* handicap = getWidget<CheckBoxWidget>("enable-handicap");
+     assert( handicap != NULL );
+diff --git a/src/utils/command_line.cpp b/src/utils/command_line.cpp
+index 3ac5af4..bf690fd 100644
+--- a/src/utils/command_line.cpp
++++ b/src/utils/command_line.cpp
+@@ -41,7 +41,10 @@ void CommandLine::init(unsigned int argc, char *argv[])
+     GetModuleFileName(NULL, path, MAX_PATH);
+     m_exec_name = StringUtils::wideToUtf8(path);
+ #else
+-    if (argc > 0)
++    /* argc counts the arguments, but a PS5 title is handed an argv whose
++       first entry is null, and reading it takes the process down. Every
++       platform benefits from the extra check; none needs argv[0] to exist. */
++    if (argc > 0 && argv != NULL && argv[0] != NULL)
+     {
+         m_exec_name = argv[0];
+     }
+diff --git a/src/utils/log.cpp b/src/utils/log.cpp
+index 7d5f1a6..a25bf62 100644
+--- a/src/utils/log.cpp
++++ b/src/utils/log.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include "utils/log.hpp"
+ 
++#include <chrono>
++
+ #include "config/user_config.hpp"
+ #include "network/network_config.hpp"
+ #include "utils/file_utils.hpp"
+@@ -325,8 +327,15 @@ void Log::openOutputFiles(const std::string &logout)
+     }
+     else
+     {
++#ifdef __PROSPERO__
++        // Buffered on the PS5: unbuffered, every line becomes several small
++        // writes to the title folder, which is slow there. The port's own
++        // stk.log stays unbuffered for crash reports.
++        setvbuf(m_file_stdout, NULL, _IOFBF, 64 * 1024);
++#else
+         // Disable buffering so that messages are seen asap
+         setvbuf(m_file_stdout, NULL, _IONBF, 0);
++#endif
+     }
+ } // closeOutputFiles
+ 
