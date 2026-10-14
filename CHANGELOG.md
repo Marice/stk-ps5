@@ -6,6 +6,13 @@ the title's `contentVersion` in `sce_sys/param.json`.
 
 ## [Unreleased]
 
+### Changed
+- Builds against the PS5 OpenGL SDK 1.0.2 release instead of a custom build
+  of the SDK. Not yet tested on a console.
+- Shader uniforms and vertex attribute locations come from the driver again.
+  SDK 1.0.2 fixes the queries that ended the process (ps5-opengl#9), so the
+  workarounds that read them from the shader source are gone.
+
 ## [00.001.000] - 2026-10-12
 
 First alpha test build of SuperTuxKart 1.5 as a native PS5 title.

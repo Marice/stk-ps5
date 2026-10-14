@@ -84,11 +84,17 @@ console over FTP, and `./log.sh` reads `stk.log` back.
 
 ### The OpenGL SDK
 
-The release build links an SDK built from upstream `main` with per-draw
-profiling turned off; the 1.0.1 release ran the 3D scenes at a fraction of
-the frame rate. The branch `stk-no-profile` of
-[Marice/ps5-opengl](https://github.com/Marice/ps5-opengl) makes that build on
-GitHub Actions.
+`main` builds against the
+[1.0.2 release](https://github.com/blackbearreloaded/ps5-opengl/releases/tag/v1.0.2)
+of the SDK, unpacked in `sdk-102/` (or wherever `PS5_OPENGL_SDK` points). It
+fixes the program queries that ended the process
+([ps5-opengl#9](https://github.com/blackbearreloaded/ps5-opengl/issues/9)) and
+no longer prints draw statistics while the game runs. This combination has
+not been tested on a console yet.
+
+Release 00.001.000 was built against an SDK from upstream `main` with
+per-draw profiling turned off, made by the branch `stk-no-profile` of
+[Marice/ps5-opengl](https://github.com/Marice/ps5-opengl).
 
 ## How the port works
 
@@ -107,11 +113,9 @@ platform:
 | `tools/make-backgrounds.py` | Home screen backgrounds (BC7 DDS) |
 
 Inside the game, the main changes are: the screen comes from EGL instead of
-SDL's video driver; shader uniforms and vertex attribute locations are read
-from the shader source, because the driver cannot list them (reported as
-[ps5-opengl#9](https://github.com/blackbearreloaded/ps5-opengl/issues/9));
-instance data uses 32-bit integers the driver can fetch; and logs are written
-buffered, because many small writes to the title folder are very slow.
+SDL's video driver; instance data uses 32-bit integers, because the driver
+cannot fetch 16-bit integer vertex attributes; and logs are written buffered,
+because many small writes to the title folder are very slow.
 
 ## Licences and credits
 
