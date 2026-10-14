@@ -7,3 +7,4 @@
 /dist/
 # Kept locally, not published.
 /docs/decision-log.md
+/sdk-102/

@@ -11,12 +11,11 @@ if(NOT PS5_PACBREW)
     endif()
 endif()
 
-# The PS5 OpenGL SDK. sdk-new is a build of upstream main from
-# github.com/Marice/ps5-opengl (branch stk-no-profile): the batching fixes
-# after 1.0.1, and no per-draw profiling. -DPS5_OPENGL_SDK=... selects another,
-# such as the 1.0.1 release in the olise-player checkout.
+# The PS5 OpenGL SDK: release 1.0.2, unpacked in sdk-102/. It fixes the
+# program queries that ended the process (ps5-opengl#9) and no longer prints
+# draw statistics while the game runs. -DPS5_OPENGL_SDK=... selects another.
 if(NOT PS5_OPENGL_SDK)
-    set(PS5_OPENGL_SDK "${CMAKE_CURRENT_LIST_DIR}/sdk-new/unpacked/ps5-opengl-sdk-ci-ea3f8788f660-38299148190-1/sdk")
+    set(PS5_OPENGL_SDK "${CMAKE_CURRENT_LIST_DIR}/sdk-102/unpacked/ps5-opengl-sdk-1.0.2/sdk")
 endif()
 
 set(OPENGL_FOUND TRUE)
